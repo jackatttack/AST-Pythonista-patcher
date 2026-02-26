@@ -3,7 +3,7 @@
 AST PATCHER — V2 (Pythonista prototype)
 
 Features:
-- Wrench-menu friendly UI: Apply (clipboard) / Revert / Cancel
+- Wrench-menu friendly UI: Apply (clipboard) / Dry Run / Revert / Cancel
 - Root = directory of the currently open editor file (editor.get_path())
 - Patches can target any file under root (including subfolders)
 - Whole-run revert (revert last run)
@@ -11,22 +11,43 @@ Features:
 - Prune old runs (keep last N)
 - Compile check + rollback-on-fail (per touched file, best-effort)
 
-Patch bundle format (same as your V1):
-- DEFAULT_FILE <path> (optional)
-- REPLACE <target>
-- INSERT_AFTER <target>
-- INSERT_BEFORE <target>
-- INSERT_INTO <target> (ANCHOR/EXPECT/INDENT/POSITION + code)
-- REPLACE_LINE <target> (ANCHOR/EXPECT + code)
+Patch bundle format:
+- DEFAULT_FILE <path>          (optional)
+- REPLACE <target>             (replace whole method / class / function)
+- INSERT_AFTER <target>        (insert code block after target)
+- INSERT_BEFORE <target>       (insert code block before target)
+- INSERT_INTO <target>         (ANCHOR/EXPECT/MATCH/OCCURRENCE/INDENT/POSITION + code)
+- REPLACE_LINE <target>        (ANCHOR/EXPECT/MATCH/OCCURRENCE + single-line replacement)
+- REPLACE_LINES <target>       (ANCHOR_START/ANCHOR_END/MATCH + multi-line replacement)
+- REPLACE_EXPR <target>        (ANCHOR/MATCH/OCCURRENCE/OLD/NEW — swap expression in a line)
+- APPEND_INTO <target>         (append code at end of target body, no anchor needed)
+- PREPEND_INTO <target>        (prepend code at start of target body, no anchor needed)
+- LIST_TARGETS <file.py>       (meta-op: list all patchable targets, copies to clipboard)
 
 Targets:
 - file.py::Class.method
+- file.py::Class.*             (whole class)
 - file.py::function_name
-- Class.method (uses DEFAULT_FILE or current editor file if present)
+- file.py::@var_name           (module-level assignment)
+- file.py::Class.@var_name     (class-level assignment)
+- Class.method                 (uses DEFAULT_FILE or current editor file)
+
+Micro-targeting directives (INSERT_INTO / REPLACE_LINE / REPLACE_LINES / REPLACE_EXPR):
+- ANCHOR: <substr>      line to target (substring match)
+- ANCHOR_START: <substr>  start of range (REPLACE_LINES only)
+- ANCHOR_END: <substr>    end of range (REPLACE_LINES only)
+- MATCH: fuzzy          normalise whitespace before matching (default: exact)
+- OCCURRENCE: N         use the Nth match, 1-based (default: 1)
+- EXPECT: N             require exactly N hits for safety (default: 1)
+- INDENT: auto|same|child  INSERT_INTO indent mode (default: auto)
+- POSITION: before|after   INSERT_INTO position (default: after)
+- OLD: <expr>           expression to replace (REPLACE_EXPR only)
+- NEW: <expr>           replacement expression (REPLACE_EXPR only)
 
 Notes:
 - This patcher patches DISK files.
 - If the currently open file is targeted and has unsaved edits, we refuse.
+- DRY_RUN=True previews patches without writing anything to disk.
 """
 
 import os
@@ -69,6 +90,8 @@ DEFAULT_CONTEXT_LINES = 25
 
 PRINT_OP_LINES_TO_CONSOLE = True
 ALWAYS_COPY_RUN_PACKET = True
+
+DRY_RUN = False          # Set True to preview patches without writing to disk
 
 
 # =========================
@@ -456,10 +479,15 @@ def parse_patch_bundle(text):
     def is_op_header(line):
         s = line.strip()
         return (s.startswith('REPLACE ') or
+                s.startswith('REPLACE_LINE ') or
+                s.startswith('REPLACE_LINES ') or
+                s.startswith('REPLACE_EXPR ') or
                 s.startswith('INSERT_AFTER ') or
                 s.startswith('INSERT_BEFORE ') or
                 s.startswith('INSERT_INTO ') or
-                s.startswith('REPLACE_LINE '))
+                s.startswith('APPEND_INTO ') or
+                s.startswith('PREPEND_INTO ') or
+                s.startswith('LIST_TARGETS '))
 
     def is_default_file(line):
         return line.strip().startswith('DEFAULT_FILE ')
@@ -472,9 +500,15 @@ def parse_patch_bundle(text):
 
     def parse_line_op_body(body_lines):
         anchor = None
+        anchor_start = None
+        anchor_end = None
         expect = 1
+        occurrence = 1
+        match_mode = 'exact'
         indent_mode = 'auto'
         position = 'after'
+        old_expr = None
+        new_expr = None
         code_lines = []
         in_code = False
         for ln in body_lines:
@@ -482,22 +516,38 @@ def parse_patch_bundle(text):
                 s = ln.strip()
                 if s.startswith('ANCHOR:'):
                     anchor = s[len('ANCHOR:'):].strip()
+                elif s.startswith('ANCHOR_START:'):
+                    anchor_start = s[len('ANCHOR_START:'):].strip()
+                elif s.startswith('ANCHOR_END:'):
+                    anchor_end = s[len('ANCHOR_END:'):].strip()
                 elif s.startswith('EXPECT:'):
                     try:
                         expect = int(s[len('EXPECT:'):].strip())
                     except ValueError:
                         expect = 1
+                elif s.startswith('OCCURRENCE:'):
+                    try:
+                        occurrence = int(s[len('OCCURRENCE:'):].strip())
+                    except ValueError:
+                        occurrence = 1
+                elif s.startswith('MATCH:'):
+                    match_mode = s[len('MATCH:'):].strip().lower()
                 elif s.startswith('INDENT:'):
                     indent_mode = s[len('INDENT:'):].strip().lower()
                 elif s.startswith('POSITION:'):
                     position = s[len('POSITION:'):].strip().lower()
+                elif s.startswith('OLD:'):
+                    old_expr = s[len('OLD:'):].strip()
+                elif s.startswith('NEW:'):
+                    new_expr = s[len('NEW:'):].strip()
                 elif s:
                     in_code = True
                     code_lines.append(ln)
             else:
                 code_lines.append(ln)
         code = '\n'.join(code_lines).rstrip() + '\n' if code_lines else ''
-        return anchor, expect, indent_mode, position, code
+        return (anchor, anchor_start, anchor_end, expect, occurrence, match_mode,
+                indent_mode, position, old_expr, new_expr, code)
 
     while i < len(lines):
         while i < len(lines) and not lines[i].strip():
@@ -516,21 +566,39 @@ def parse_patch_bundle(text):
             raise ValueError('Patch parse error: expected op header at line ' + str(i+1) + ': ' + repr(line))
 
         s = line.strip()
-        if s.startswith('REPLACE_LINE '):
+        if s.startswith('REPLACE_LINES '):
+            op = 'REPLACE_LINES'
+            target = s[len('REPLACE_LINES '):].strip()
+        elif s.startswith('REPLACE_LINE '):
             op = 'REPLACE_LINE'
             target = s[len('REPLACE_LINE '):].strip()
-        elif s.startswith('INSERT_INTO '):
-            op = 'INSERT_INTO'
-            target = s[len('INSERT_INTO '):].strip()
+        elif s.startswith('REPLACE_EXPR '):
+            op = 'REPLACE_EXPR'
+            target = s[len('REPLACE_EXPR '):].strip()
         elif s.startswith('REPLACE '):
             op = 'REPLACE'
             target = s[len('REPLACE '):].strip()
         elif s.startswith('INSERT_AFTER '):
             op = 'INSERT_AFTER'
             target = s[len('INSERT_AFTER '):].strip()
-        else:
+        elif s.startswith('INSERT_BEFORE '):
             op = 'INSERT_BEFORE'
             target = s[len('INSERT_BEFORE '):].strip()
+        elif s.startswith('INSERT_INTO '):
+            op = 'INSERT_INTO'
+            target = s[len('INSERT_INTO '):].strip()
+        elif s.startswith('APPEND_INTO '):
+            op = 'APPEND_INTO'
+            target = s[len('APPEND_INTO '):].strip()
+        elif s.startswith('PREPEND_INTO '):
+            op = 'PREPEND_INTO'
+            target = s[len('PREPEND_INTO '):].strip()
+        elif s.startswith('LIST_TARGETS '):
+            op = 'LIST_TARGETS'
+            target = s[len('LIST_TARGETS '):].strip()
+        else:
+            op = 'REPLACE'
+            target = s
 
         i += 1
 
@@ -539,8 +607,9 @@ def parse_patch_bundle(text):
             body_lines.append(lines[i])
             i += 1
 
-        if op in ('INSERT_INTO', 'REPLACE_LINE'):
-            anchor, expect, indent_mode, position, code = parse_line_op_body(body_lines)
+        if op in ('INSERT_INTO', 'REPLACE_LINE', 'REPLACE_LINES', 'REPLACE_EXPR'):
+            (anchor, anchor_start, anchor_end, expect, occurrence, match_mode,
+             indent_mode, position, old_expr, new_expr, code) = parse_line_op_body(body_lines)
             ops.append({
                 'op': op,
                 'target': target,
@@ -548,9 +617,15 @@ def parse_patch_bundle(text):
                 'sig': first_sig(code) if code else '',
                 'default_file': bundle_default_file,
                 'anchor': anchor,
+                'anchor_start': anchor_start,
+                'anchor_end': anchor_end,
                 'expect': expect,
+                'occurrence': occurrence,
+                'match_mode': match_mode,
                 'indent_mode': indent_mode,
                 'position': position,
+                'old_expr': old_expr,
+                'new_expr': new_expr,
                 'code': code,
             })
         else:
@@ -610,271 +685,6 @@ def apply_ops(ops, project_root, default_file_abs):
         return re.search(pat, src, flags=re.M) is not None
 
     def _locate(src, class_name, method_name):
-        if class_name is not None and isinstance(method_name, str) and method_name.startswith('@'):
-            return find_class_assign_range(src, class_name, method_name[1:])
-        if class_name is None and isinstance(method_name, str) and method_name.startswith('@'):
-            return find_global_assign_range(src, method_name[1:])
-        if class_name is None:
-            return find_function_range(src, method_name)
-        return find_method_range(src, class_name, method_name)
-
-    def _find_anchor_hits(src_lines, block_start, block_end, anchor):
-        hits = []
-        for i, line in enumerate(src_lines[block_start - 1:block_end]):
-            if anchor in line:
-                hits.append((block_start + i, line))
-        return hits
-
-    for idx, op in enumerate(ops):
-        rec = results[idx]
-        try:
-            file_ref, class_name, method_name = parse_target(
-                op.get('target'),
-                default_file_abs,
-                op_default_file=op.get('default_file')
-            )
-
-            file_abs = os.path.realpath(os.path.abspath(
-                file_ref if os.path.isabs(file_ref)
-                else os.path.join(project_root, file_ref)
-            ))
-
-            if not (file_abs == root_abs or file_abs.startswith(root_abs + os.sep)):
-                rec['status'] = 'FAILED_INVALID_PATH'
-                rec['message'] = 'Target file escapes project root'
-                continue
-
-            if not os.path.isfile(file_abs):
-                rec['status'] = 'FAILED_IO'
-                rec['message'] = 'File not found: ' + file_abs
-                continue
-
-            rec['file'] = os.path.relpath(file_abs, project_root)
-
-            src = file_cache.get(file_abs)
-            if src is None:
-                src = read_text(file_abs)
-                file_cache[file_abs] = src
-
-            if file_abs not in touched_files:
-                touched_files[file_abs] = {
-                    'before': src,
-                    'after': None,
-                    'compile_ok': None,
-                    'compile_error': ''
-                }
-
-            found = _locate(src, class_name, method_name)
-            if found is None:
-                rec['status'] = 'FAILED_NOT_FOUND'
-                rec['message'] = 'Target not found: ' + str(class_name) + '.' + method_name
-                continue
-            if isinstance(found, tuple) and len(found) == 2 and found[0] == 'AMBIGUOUS':
-                rec['status'] = 'FAILED_AMBIGUOUS'
-                rec['message'] = 'Ambiguous matches: ' + str(found[1])
-                continue
-
-            start_line, end_line = found
-            rec['range'] = [start_line, end_line]
-
-            src_lines = src.splitlines()
-            before_block = '\n'.join(src_lines[start_line - 1:end_line]) + '\n'
-            rec['hash_before'] = sha256_text(before_block)
-
-            op_kind = op.get('op')
-
-            if op_kind == 'REPLACE':
-                patched = replace_lines(src, start_line, end_line, op.get('body'))
-                if sha256_text(patched) == sha256_text(src):
-                    rec['status'] = 'SKIPPED_ALREADY_APPLIED'
-                    rec['hash_after'] = rec['hash_before']
-                    continue
-                file_cache[file_abs] = patched
-                rec['status'] = 'APPLIED'
-                rec['hash_after'] = sha256_text(patched)
-
-            elif op_kind in ('INSERT_AFTER', 'INSERT_BEFORE'):
-                if op_kind == 'INSERT_AFTER':
-                    insert_line = end_line
-                    ref_line = src.splitlines(True)[start_line - 1]
-                else:
-                    insert_line = start_line - 1
-                    ref_line = src.splitlines(True)[start_line - 1]
-
-                indent = get_line_indent(ref_line)
-
-                sig_line = _first_sig_line(op.get('body'), op.get('sig'))
-                def_name = _def_name_from_sig(sig_line)
-
-                # idempotence: if a def name exists anywhere in file, skip
-                if def_name and _has_def_anywhere(src, def_name):
-                    rec['status'] = 'SKIPPED_ALREADY_PRESENT'
-                    rec['hash_after'] = rec['hash_before']
-                    continue
-                if (not def_name) and sig_line and (sig_line in src):
-                    rec['status'] = 'SKIPPED_ALREADY_PRESENT'
-                    rec['hash_after'] = rec['hash_before']
-                    continue
-
-                patched = insert_after_lines(src, insert_line, op.get('body'), indent, tight=False)
-                if sha256_text(patched) == sha256_text(src):
-                    rec['status'] = 'SKIPPED_ALREADY_PRESENT'
-                    rec['hash_after'] = rec['hash_before']
-                    continue
-
-                file_cache[file_abs] = patched
-                rec['status'] = 'APPLIED'
-                rec['hash_after'] = sha256_text(patched)
-
-            elif op_kind == 'INSERT_INTO':
-                anchor = op.get('anchor')
-                expect = op.get('expect', 1)
-                indent_mode = op.get('indent_mode', 'auto')
-                position = op.get('position', 'after')
-                code = op.get('code', '')
-
-                if not anchor:
-                    rec['status'] = 'FAILED_PARSE'
-                    rec['message'] = 'INSERT_INTO requires ANCHOR'
-                    continue
-
-                hits = _find_anchor_hits(src.splitlines(), start_line, end_line, anchor)
-                if len(hits) != expect:
-                    rec['status'] = 'SKIPPED_ANCHOR_MISMATCH'
-                    rec['message'] = 'ANCHOR %r matched %d times, expected %d' % (anchor, len(hits), expect)
-                    continue
-
-                anchor_lineno, anchor_line_text = hits[0]
-                anchor_indent = get_line_indent(anchor_line_text)
-
-                if indent_mode == 'same':
-                    insert_indent = anchor_indent
-                elif indent_mode == 'child':
-                    opens_block = anchor_line_text.rstrip().endswith(':')
-                    has_deeper = any(
-                        bl.strip() and len(get_line_indent(bl)) > len(anchor_indent)
-                        for bl in src.splitlines()[anchor_lineno:end_line]
-                    )
-                    if not opens_block and not has_deeper:
-                        rec['status'] = 'FAILED_PARSE'
-                        rec['message'] = 'INDENT: child refused - anchor does not open a block'
-                        continue
-                    insert_indent = anchor_indent + '    '
-                else:
-                    if anchor_line_text.rstrip().endswith(':'):
-                        insert_indent = anchor_indent + '    '
-                    else:
-                        insert_indent = anchor_indent
-
-                # idempotence
-                sig_line = (op.get('sig') or '').strip()
-                if sig_line and sig_line in src:
-                    rec['status'] = 'SKIPPED_ALREADY_PRESENT'
-                    rec['hash_after'] = rec['hash_before']
-                    continue
-
-                if position == 'before':
-                    insert_line = anchor_lineno - 1
-                else:
-                    insert_line = anchor_lineno
-
-                patched = insert_after_lines(src, insert_line, code, insert_indent, tight=True)
-                if sha256_text(patched) == sha256_text(src):
-                    rec['status'] = 'SKIPPED_ALREADY_PRESENT'
-                    rec['hash_after'] = rec['hash_before']
-                    continue
-
-                file_cache[file_abs] = patched
-                rec['status'] = 'APPLIED'
-                rec['hash_after'] = sha256_text(patched)
-
-            elif op_kind == 'REPLACE_LINE':
-                anchor = op.get('anchor')
-                expect = op.get('expect', 1)
-                code = (op.get('code', '') or '').strip()
-
-                if not anchor:
-                    rec['status'] = 'FAILED_PARSE'
-                    rec['message'] = 'REPLACE_LINE requires ANCHOR'
-                    continue
-
-                src_lines_raw = src.splitlines(True)
-                hits = _find_anchor_hits([ln.rstrip("\n") for ln in src_lines_raw], start_line, end_line, anchor)
-
-                if len(hits) != expect:
-                    rec['status'] = 'SKIPPED_ANCHOR_MISMATCH'
-                    rec['message'] = 'ANCHOR %r matched %d times, expected %d' % (anchor, len(hits), expect)
-                    continue
-
-                anchor_lineno, anchor_line_text = hits[0]
-                line_indent = get_line_indent(anchor_line_text)
-                new_line = line_indent + code + '\n'
-
-                if new_line.rstrip() == anchor_line_text.rstrip():
-                    rec['status'] = 'SKIPPED_ALREADY_APPLIED'
-                    rec['hash_after'] = rec['hash_before']
-                    continue
-
-                new_src_lines = src_lines_raw[:anchor_lineno - 1] + [new_line] + src_lines_raw[anchor_lineno:]
-                patched = ''.join(new_src_lines)
-
-                file_cache[file_abs] = patched
-                rec['status'] = 'APPLIED'
-                rec['hash_after'] = sha256_text(patched)
-
-            else:
-                rec['status'] = 'FAILED_PARSE'
-                rec['message'] = 'Unsupported op: ' + str(op_kind)
-
-        except Exception as e:
-            rec['status'] = 'FAILED_PARSE'
-            rec['message'] = type(e).__name__ + ': ' + str(e)
-
-    return results, touched_files, file_cache
-
-
-#REPLACE apply_ops
-def apply_ops(ops, project_root, default_file_abs):
-    import re
-
-    results = []
-    touched_files = {}   # file_abs -> meta
-    file_cache = {}      # file_abs -> in-memory updated source
-
-    root_abs = os.path.abspath(project_root)
-
-    for op in ops:
-        results.append({
-            'op': op.get('op'),
-            'target': op.get('target'),
-            'status': None,
-            'file': None,
-            'range': None,
-            'hash_before': None,
-            'hash_after': None,
-            'compile_ok': None,
-            'message': '',
-            'sig': op.get('sig', '')
-        })
-
-    def _first_sig_line(body, fallback_sig=''):
-        s = (fallback_sig or '').strip()
-        if s:
-            return s
-        for ln in (body or '').splitlines():
-            if ln.strip():
-                return ln.strip()
-        return ''
-
-    def _def_name_from_sig(sig_line):
-        m = re.match(r'^\s*def\s+([A-Za-z_]\w*)\s*\(', sig_line or '')
-        return m.group(1) if m else None
-
-    def _has_def_anywhere(src, name):
-        pat = r'^\s*def\s+' + re.escape(name) + r'\s*\('
-        return re.search(pat, src, flags=re.M) is not None
-
-    def _locate(src, class_name, method_name):
         # Whole-class target support: Class.*  (e.g. file.py::MyClass.*)
         if class_name is not None and method_name == '*':
             return find_class_range(src, class_name)
@@ -890,16 +700,90 @@ def apply_ops(ops, project_root, default_file_abs):
             return find_function_range(src, method_name)
         return find_method_range(src, class_name, method_name)
 
-    def _find_anchor_hits(src_lines, block_start, block_end, anchor):
+    def _find_anchor_hits(src_lines, block_start, block_end, anchor, match_mode='exact'):
+        anchor_cmp = ' '.join(anchor.split()) if match_mode == 'fuzzy' else anchor
         hits = []
         for i, line in enumerate(src_lines[block_start - 1:block_end]):
-            if anchor in line:
+            line_cmp = ' '.join(line.split()) if match_mode == 'fuzzy' else line
+            if anchor_cmp in line_cmp:
                 hits.append((block_start + i, line))
         return hits
 
+    def _anchor_mismatch_msg(anchor, hits_count, expect, src_lines, start_line, end_line):
+        block_lines = src_lines[start_line - 1 : min(start_line + 7, end_line)]
+        excerpt = '\n'.join('  ' + l for l in block_lines)
+        return ('ANCHOR %r matched %d times, expected %d.\nBlock starts:\n%s'
+                % (anchor, hits_count, expect, excerpt))
+
     for idx, op in enumerate(ops):
         rec = results[idx]
+        op_kind = op.get('op')
         try:
+            # LIST_TARGETS is a meta-op: only needs a file path, no class/method
+            if op_kind == 'LIST_TARGETS':
+                target_raw = (op.get('target') or '').strip()
+                if '::' in target_raw:
+                    file_ref = target_raw.split('::', 1)[0].strip()
+                else:
+                    file_ref = target_raw or default_file_abs
+                file_abs = os.path.realpath(os.path.abspath(
+                    file_ref if os.path.isabs(file_ref)
+                    else os.path.join(project_root, file_ref)
+                ))
+                if not (file_abs == root_abs or file_abs.startswith(root_abs + os.sep)):
+                    rec['status'] = 'FAILED_INVALID_PATH'
+                    rec['message'] = 'Target file escapes project root'
+                    continue
+                if not os.path.isfile(file_abs):
+                    rec['status'] = 'FAILED_IO'
+                    rec['message'] = 'File not found: ' + file_abs
+                    continue
+                rec['file'] = os.path.relpath(file_abs, project_root)
+                src = file_cache.get(file_abs) or read_text(file_abs)
+                try:
+                    tree = ast.parse(src)
+                except SyntaxError as e:
+                    rec['status'] = 'FAILED_PARSE'
+                    rec['message'] = 'SyntaxError: ' + str(e)
+                    continue
+                file_rel = rec['file']
+                targets_found = []
+                for node in tree.body:
+                    if isinstance(node, ast.ClassDef):
+                        targets_found.append(file_rel + '::' + node.name + '.*')
+                        for item in node.body:
+                            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                targets_found.append(file_rel + '::' + node.name + '.' + item.name)
+                            elif isinstance(item, ast.Assign):
+                                for t in (item.targets or []):
+                                    if isinstance(t, ast.Name):
+                                        targets_found.append(file_rel + '::' + node.name + '.@' + t.id)
+                            elif isinstance(item, ast.AnnAssign):
+                                t = getattr(item, 'target', None)
+                                if isinstance(t, ast.Name):
+                                    targets_found.append(file_rel + '::' + node.name + '.@' + t.id)
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        targets_found.append(file_rel + '::' + node.name)
+                    elif isinstance(node, ast.Assign):
+                        for t in (node.targets or []):
+                            if isinstance(t, ast.Name):
+                                targets_found.append(file_rel + '::@' + t.id)
+                    elif isinstance(node, ast.AnnAssign):
+                        t = getattr(node, 'target', None)
+                        if isinstance(t, ast.Name):
+                            targets_found.append(file_rel + '::@' + t.id)
+                targets_str = '\n'.join(targets_found)
+                rec['status'] = 'APPLIED'
+                rec['message'] = 'Targets found: %d' % len(targets_found)
+                rec['hash_before'] = sha256_text(src)
+                rec['hash_after'] = rec['hash_before']
+                if clipboard is not None:
+                    try:
+                        clipboard.set(targets_str)
+                    except Exception:
+                        pass
+                continue
+
             file_ref, class_name, method_name = parse_target(
                 op.get('target'),
                 default_file_abs,
@@ -1000,6 +884,8 @@ def apply_ops(ops, project_root, default_file_abs):
             elif op_kind == 'INSERT_INTO':
                 anchor = op.get('anchor')
                 expect = op.get('expect', 1)
+                occurrence = op.get('occurrence', 1)
+                match_mode = op.get('match_mode', 'exact')
                 indent_mode = op.get('indent_mode', 'auto')
                 position = op.get('position', 'after')
                 code = op.get('code', '')
@@ -1009,13 +895,18 @@ def apply_ops(ops, project_root, default_file_abs):
                     rec['message'] = 'INSERT_INTO requires ANCHOR'
                     continue
 
-                hits = _find_anchor_hits(src.splitlines(), start_line, end_line, anchor)
+                hits = _find_anchor_hits(src.splitlines(), start_line, end_line, anchor, match_mode)
                 if len(hits) != expect:
                     rec['status'] = 'SKIPPED_ANCHOR_MISMATCH'
-                    rec['message'] = 'ANCHOR %r matched %d times, expected %d' % (anchor, len(hits), expect)
+                    rec['message'] = _anchor_mismatch_msg(anchor, len(hits), expect, src.splitlines(), start_line, end_line)
                     continue
 
-                anchor_lineno, anchor_line_text = hits[0]
+                if occurrence < 1 or occurrence > len(hits):
+                    rec['status'] = 'FAILED_PARSE'
+                    rec['message'] = 'OCCURRENCE %d out of range (1..%d)' % (occurrence, len(hits))
+                    continue
+
+                anchor_lineno, anchor_line_text = hits[occurrence - 1]
                 anchor_indent = get_line_indent(anchor_line_text)
 
                 if indent_mode == 'same':
@@ -1061,6 +952,8 @@ def apply_ops(ops, project_root, default_file_abs):
             elif op_kind == 'REPLACE_LINE':
                 anchor = op.get('anchor')
                 expect = op.get('expect', 1)
+                occurrence = op.get('occurrence', 1)
+                match_mode = op.get('match_mode', 'exact')
                 code = (op.get('code', '') or '').strip()
 
                 if not anchor:
@@ -1069,14 +962,19 @@ def apply_ops(ops, project_root, default_file_abs):
                     continue
 
                 src_lines_raw = src.splitlines(True)
-                hits = _find_anchor_hits([ln.rstrip("\n") for ln in src_lines_raw], start_line, end_line, anchor)
+                hits = _find_anchor_hits([ln.rstrip("\n") for ln in src_lines_raw], start_line, end_line, anchor, match_mode)
 
                 if len(hits) != expect:
                     rec['status'] = 'SKIPPED_ANCHOR_MISMATCH'
-                    rec['message'] = 'ANCHOR %r matched %d times, expected %d' % (anchor, len(hits), expect)
+                    rec['message'] = _anchor_mismatch_msg(anchor, len(hits), expect, src.splitlines(), start_line, end_line)
                     continue
 
-                anchor_lineno, anchor_line_text = hits[0]
+                if occurrence < 1 or occurrence > len(hits):
+                    rec['status'] = 'FAILED_PARSE'
+                    rec['message'] = 'OCCURRENCE %d out of range (1..%d)' % (occurrence, len(hits))
+                    continue
+
+                anchor_lineno, anchor_line_text = hits[occurrence - 1]
                 line_indent = get_line_indent(anchor_line_text)
                 new_line = line_indent + code + '\n'
 
@@ -1088,6 +986,132 @@ def apply_ops(ops, project_root, default_file_abs):
                 new_src_lines = src_lines_raw[:anchor_lineno - 1] + [new_line] + src_lines_raw[anchor_lineno:]
                 patched = ''.join(new_src_lines)
 
+                file_cache[file_abs] = patched
+                rec['status'] = 'APPLIED'
+                rec['hash_after'] = sha256_text(patched)
+
+            elif op_kind == 'REPLACE_LINES':
+                anchor_start = op.get('anchor_start')
+                anchor_end = op.get('anchor_end')
+                match_mode = op.get('match_mode', 'exact')
+                code = op.get('code', '')
+
+                if not anchor_start or not anchor_end:
+                    rec['status'] = 'FAILED_PARSE'
+                    rec['message'] = 'REPLACE_LINES requires ANCHOR_START and ANCHOR_END'
+                    continue
+
+                src_lines_stripped = [ln.rstrip("\n") for ln in src.splitlines(True)]
+                hits_s = _find_anchor_hits(src_lines_stripped, start_line, end_line, anchor_start, match_mode)
+                hits_e = _find_anchor_hits(src_lines_stripped, start_line, end_line, anchor_end, match_mode)
+
+                if len(hits_s) != 1:
+                    rec['status'] = 'SKIPPED_ANCHOR_MISMATCH'
+                    rec['message'] = 'ANCHOR_START %r matched %d times, expected 1' % (anchor_start, len(hits_s))
+                    continue
+                if len(hits_e) != 1:
+                    rec['status'] = 'SKIPPED_ANCHOR_MISMATCH'
+                    rec['message'] = 'ANCHOR_END %r matched %d times, expected 1' % (anchor_end, len(hits_e))
+                    continue
+
+                line_s, _ = hits_s[0]
+                line_e, _ = hits_e[0]
+                if line_e < line_s:
+                    rec['status'] = 'FAILED_PARSE'
+                    rec['message'] = 'ANCHOR_END appears before ANCHOR_START in source'
+                    continue
+
+                patched = replace_lines(src, line_s, line_e, code)
+                if sha256_text(patched) == sha256_text(src):
+                    rec['status'] = 'SKIPPED_ALREADY_APPLIED'
+                    rec['hash_after'] = rec['hash_before']
+                    continue
+                file_cache[file_abs] = patched
+                rec['status'] = 'APPLIED'
+                rec['hash_after'] = sha256_text(patched)
+
+            elif op_kind in ('APPEND_INTO', 'PREPEND_INTO'):
+                code = op.get('body', '')
+                src_lines_list = src.splitlines(True)
+                block_lines = src_lines_list[start_line - 1 : end_line]
+
+                if op_kind == 'PREPEND_INTO':
+                    # Insert right after the def/class header line
+                    ref_line = src_lines_list[start_line - 1] if src_lines_list else ''
+                    insert_indent = get_line_indent(ref_line) + '    '
+                    insert_pos = start_line
+                else:
+                    # Find last non-blank line in block, insert after it
+                    last_content_idx = None
+                    for i, ln in enumerate(block_lines):
+                        if ln.strip():
+                            last_content_idx = i
+                    if last_content_idx is None:
+                        last_content_idx = len(block_lines) - 1
+                    ref_line = block_lines[last_content_idx] if block_lines else ''
+                    insert_indent = get_line_indent(ref_line)
+                    insert_pos = start_line - 1 + last_content_idx + 1
+
+                sig_line = (op.get('sig') or '').strip()
+                if sig_line and sig_line in src:
+                    rec['status'] = 'SKIPPED_ALREADY_PRESENT'
+                    rec['hash_after'] = rec['hash_before']
+                    continue
+
+                patched = insert_after_lines(src, insert_pos, code, insert_indent, tight=True)
+                if sha256_text(patched) == sha256_text(src):
+                    rec['status'] = 'SKIPPED_ALREADY_PRESENT'
+                    rec['hash_after'] = rec['hash_before']
+                    continue
+                file_cache[file_abs] = patched
+                rec['status'] = 'APPLIED'
+                rec['hash_after'] = sha256_text(patched)
+
+            elif op_kind == 'REPLACE_EXPR':
+                anchor = op.get('anchor')
+                expect = op.get('expect', 1)
+                occurrence = op.get('occurrence', 1)
+                match_mode = op.get('match_mode', 'exact')
+                old_expr = op.get('old_expr')
+                new_expr = op.get('new_expr')
+
+                if not anchor:
+                    rec['status'] = 'FAILED_PARSE'
+                    rec['message'] = 'REPLACE_EXPR requires ANCHOR'
+                    continue
+                if old_expr is None or new_expr is None:
+                    rec['status'] = 'FAILED_PARSE'
+                    rec['message'] = 'REPLACE_EXPR requires OLD and NEW'
+                    continue
+
+                src_lines_raw = src.splitlines(True)
+                hits = _find_anchor_hits([ln.rstrip("\n") for ln in src_lines_raw], start_line, end_line, anchor, match_mode)
+
+                if len(hits) != expect:
+                    rec['status'] = 'SKIPPED_ANCHOR_MISMATCH'
+                    rec['message'] = _anchor_mismatch_msg(anchor, len(hits), expect, src.splitlines(), start_line, end_line)
+                    continue
+                if occurrence < 1 or occurrence > len(hits):
+                    rec['status'] = 'FAILED_PARSE'
+                    rec['message'] = 'OCCURRENCE %d out of range (1..%d)' % (occurrence, len(hits))
+                    continue
+
+                anchor_lineno, anchor_line_text = hits[occurrence - 1]
+                if old_expr not in anchor_line_text:
+                    rec['status'] = 'SKIPPED_ANCHOR_MISMATCH'
+                    rec['message'] = 'OLD %r not found in anchor line: %r' % (old_expr, anchor_line_text.strip())
+                    continue
+
+                new_line_text = anchor_line_text.replace(old_expr, new_expr, 1)
+                if new_line_text == anchor_line_text:
+                    rec['status'] = 'SKIPPED_ALREADY_APPLIED'
+                    rec['hash_after'] = rec['hash_before']
+                    continue
+
+                if not new_line_text.endswith('\n'):
+                    new_line_text += '\n'
+                new_src_lines = src_lines_raw[:anchor_lineno - 1] + [new_line_text] + src_lines_raw[anchor_lineno:]
+                patched = ''.join(new_src_lines)
                 file_cache[file_abs] = patched
                 rec['status'] = 'APPLIED'
                 rec['hash_after'] = sha256_text(patched)
@@ -1351,7 +1375,7 @@ def current_file_dirty(cur_path):
         return False
     return sha256_text(disk) != sha256_text(buf)
 
-def apply_from_clipboard(project_root, default_file_abs, cur_path):
+def apply_from_clipboard(project_root, default_file_abs, cur_path, dry_run=False):
     if clipboard is None:
         _hud("clipboard module unavailable", "error", 1.2)
         return
@@ -1390,21 +1414,23 @@ def apply_from_clipboard(project_root, default_file_abs, cur_path):
     # Apply in memory
     results, touched_files, file_cache = apply_ops(ops, project_root, default_file_abs)
 
-    # Write + compile verify (+ rollback)
-    verify_write_and_maybe_rollback(touched_files, file_cache)
-    propagate_compile_to_results(project_root, results, touched_files)
-
-    # Persist run artifacts
-    run_dir, summary_path, jsonl_path = write_run_artifacts(project_root, stamp, bundle_text, results, touched_files, file_cache)
-    prune_runs(project_root, KEEP_RUNS)
+    if not dry_run:
+        # Write + compile verify (+ rollback)
+        verify_write_and_maybe_rollback(touched_files, file_cache)
+        propagate_compile_to_results(project_root, results, touched_files)
+        # Persist run artifacts
+        run_dir, summary_path, jsonl_path = write_run_artifacts(project_root, stamp, bundle_text, results, touched_files, file_cache)
+        prune_runs(project_root, KEEP_RUNS)
+    else:
+        run_dir = summary_path = jsonl_path = '(dry run — nothing written)'
 
     # Console lines
     if PRINT_OP_LINES_TO_CONSOLE:
         for r in results:
             print((r.get("status") or "UNKNOWN") + " | " + (r.get("op") or "?") + " | " + (r.get("target") or "?"))
 
-    # Reload current editor buffer if it was targeted (now safe because we refused dirty)
-    if cur_path and os.path.realpath(os.path.abspath(cur_path)) in targets_abs:
+    # Reload current editor buffer if it was targeted (skip in dry-run)
+    if not dry_run and cur_path and os.path.realpath(os.path.abspath(cur_path)) in targets_abs:
         try:
             new_disk = read_text(cur_path)
             _editor_replace_all(new_disk)
@@ -1444,7 +1470,12 @@ def apply_from_clipboard(project_root, default_file_abs, cur_path):
         except Exception:
             pass
 
-    if failed:
+    if dry_run:
+        summary_lines = [r.get('status', '?') + ' | ' + r.get('op', '?') + ' | ' + r.get('target', '?') for r in results]
+        _alert("DRY RUN — nothing written",
+               f"APPLIED={applied}  SKIPPED={skipped}  FAILED={failed}\n\n" + "\n".join(summary_lines),
+               "OK")
+    elif failed:
         _hud(f"Applied {applied} • Failed {failed} • Skipped {skipped}", "error", 1.3)
     else:
         _hud(f"Applied {applied} • Skipped {skipped}", "success", 1.2)
@@ -1503,12 +1534,15 @@ def main():
 
     # UI
     msg = "Root:\n" + os.path.abspath(project_root)
-    choice = _alert("AST Patcher", msg, "Apply patch (clipboard)", "Revert", "Cancel")
+    choice = _alert("AST Patcher", msg, "Apply (clipboard)", "Dry Run", "Revert")
 
     if choice == 1:
-        apply_from_clipboard(project_root, default_file_abs, cur_path)
+        apply_from_clipboard(project_root, default_file_abs, cur_path, dry_run=DRY_RUN)
         return
     if choice == 2:
+        apply_from_clipboard(project_root, default_file_abs, cur_path, dry_run=True)
+        return
+    if choice == 3:
         revert_last_run_ui(project_root, cur_path)
         return
 
